@@ -1,4 +1,6 @@
 import { NextRequest, NextResponse } from "next/server";
+import { DatabaseService } from "@/lib/db";
+import { chatWithModel, type ChatMessage } from "@/lib/openrouter";
 
 export async function POST(request: NextRequest) {
   try {
@@ -11,82 +13,111 @@ export async function POST(request: NextRequest) {
       );
     }
 
-    // TODO: Implement actual multi-model comparison
-    // For now, return mock responses for all models
+    // Create or get session
+    let session;
+    if (sessionId === "new") {
+      session = await DatabaseService.createSession({ mode: "compare" });
+    } else {
+      session = await DatabaseService.getSession(sessionId);
+      if (!session) {
+        return NextResponse.json(
+          { error: "Session not found" },
+          { status: 404 }
+        );
+      }
+    }
 
-    const mockResponses = models.map((model) => ({
-      model,
-      content: `This is a mock response from ${model} for comparison mode. 
-
-The user asked: "${message}"
-
-In the real implementation, this would:
-1. Send the same prompt to multiple AI providers simultaneously
-2. Stream responses from each model in parallel
-3. Track performance metrics (latency, tokens, cost)
-4. Allow side-by-side comparison of responses
-5. Provide aggregated analytics
-
-Model: ${model}
-Response time: ${Math.floor(Math.random() * 2000 + 500)}ms
-Tokens used: ${Math.floor(Math.random() * 200 + 50)}`,
-      tokens: Math.floor(Math.random() * 200 + 50),
-      latency: Math.floor(Math.random() * 2000 + 500),
-      cost: Math.random() * 0.05,
-    }));
-
-    // Simulate streaming comparison responses
-    const encoder = new TextEncoder();
-    const stream = new ReadableStream({
-      start(controller) {
-        let modelIndex = 0;
-        let wordIndex = 0;
-
-        const sendNextChunk = () => {
-          if (modelIndex < mockResponses.length) {
-            const response = mockResponses[modelIndex];
-            const words = response.content.split(" ");
-
-            if (wordIndex < words.length) {
-              const chunk = words[wordIndex] + " ";
-              controller.enqueue(
-                encoder.encode(
-                  `data: ${JSON.stringify({
-                    model: response.model,
-                    content: chunk,
-                    tokens: response.tokens,
-                    latency: response.latency,
-                    cost: response.cost,
-                  })}\n\n`
-                )
-              );
-              wordIndex++;
-              setTimeout(sendNextChunk, 50);
-            } else {
-              // Move to next model
-              modelIndex++;
-              wordIndex = 0;
-              setTimeout(sendNextChunk, 100);
-            }
-          } else {
-            controller.enqueue(encoder.encode(`data: [DONE]\n\n`));
-            controller.close();
-          }
-        };
-
-        sendNextChunk();
-      },
+    // Save user message to database
+    const userMessage = await DatabaseService.createMessage({
+      sessionId: session.id,
+      model: "multi-model",
+      role: "user",
+      content: message,
     });
 
-    return new NextResponse(stream, {
-      headers: {
-        "Content-Type": "text/plain; charset=utf-8",
-        "Cache-Control": "no-cache",
-        Connection: "keep-alive",
-      },
+    // Prepare messages for AI (include conversation history)
+    const conversationHistory = await DatabaseService.getSessionMessages(
+      session.id
+    );
+    const aiMessages: ChatMessage[] = conversationHistory.map((msg: any) => ({
+      role: msg.role as "user" | "assistant",
+      content: msg.content,
+    }));
+
+    // Add system message for context
+    const systemMessage: ChatMessage = {
+      role: "system",
+      content:
+        "You are a helpful AI assistant. Provide clear, accurate, and helpful responses.",
+    };
+
+    const messages = [systemMessage, ...aiMessages];
+
+    // Get responses from all models in parallel
+    const modelPromises = models.map(async (model) => {
+      try {
+        const response = await chatWithModel(model, messages);
+
+        // Save assistant message to database
+        await DatabaseService.createMessage({
+          sessionId: session.id,
+          model,
+          role: "assistant",
+          content: response.content,
+          tokensIn: response.tokens.input,
+          tokensOut: response.tokens.output,
+          latencyMs: response.latency,
+        });
+
+        // Save usage log
+        await DatabaseService.createUsageLog({
+          sessionId: session.id,
+          provider: response.provider,
+          model: response.model,
+          tokens: response.tokens.input + response.tokens.output,
+          cost: response.cost,
+        });
+
+        return {
+          model,
+          content: response.content,
+          provider: response.provider,
+          tokens: response.tokens,
+          cost: response.cost,
+          latency: response.latency,
+        };
+      } catch (error) {
+        console.error(`Error with model ${model}:`, error);
+        return {
+          model,
+          content: `Error: Failed to get response from ${model}`,
+          provider: "unknown",
+          tokens: { input: 0, output: 0 },
+          cost: 0,
+          latency: 0,
+          error: true,
+        };
+      }
+    });
+
+    const responses = await Promise.all(modelPromises);
+
+    // Return structured comparison results
+    return NextResponse.json({
+      sessionId: session.id,
+      responses,
+      timestamp: new Date().toISOString(),
     });
   } catch (error) {
     console.error("Compare API error:", error);
+
+    if (error instanceof Error && error.message.includes("not authenticated")) {
+      return NextResponse.json(
+        { error: "Authentication required" },
+        { status: 401 }
+      );
+    }
+
     return NextResponse.json(
       { error: "Internal server error" },
       { status: 500 }

@@ -1,8 +1,10 @@
 import { NextRequest, NextResponse } from "next/server";
+import { DatabaseService } from "@/lib/db";
+import { streamChatWithModel, type ChatMessage } from "@/lib/openrouter";
 
 export async function POST(request: NextRequest) {
   try {
-    const { sessionId, model, message } = await request.json();
+    const { sessionId, model, message, mode = "single" } = await request.json();
 
     if (!sessionId || !model || !message) {
       return NextResponse.json(
@@ -11,48 +13,50 @@ export async function POST(request: NextRequest) {
       );
     }
 
-    // TODO: Implement actual AI provider integration
-    // For now, return a mock streaming response
+    // Create or get session
+    let session;
+    if (sessionId === "new") {
+      session = await DatabaseService.createSession({ mode });
+    } else {
+      session = await DatabaseService.getSession(sessionId);
+      if (!session) {
+        return NextResponse.json(
+          { error: "Session not found" },
+          { status: 404 }
+        );
+      }
+    }
 
-    const mockResponse = `This is a mock response from ${model}. In the real implementation, this would stream from the AI provider.
-
-The message you sent was: "${message}"
-
-This demonstrates how the streaming response would work. The AI would generate content in real-time, and you would see it appear word by word.
-
-Features that would be implemented:
-- Real API calls to OpenAI, Anthropic, Google, etc.
-- Token counting and cost tracking
-- Latency measurement
-- Error handling and retries
-- Rate limiting
-- User authentication`;
-
-    // Simulate streaming by sending chunks
-    const encoder = new TextEncoder();
-    const stream = new ReadableStream({
-      start(controller) {
-        const words = mockResponse.split(" ");
-        let index = 0;
-
-        const sendChunk = () => {
-          if (index < words.length) {
-            const chunk = words[index] + " ";
-            controller.enqueue(
-              encoder.encode(`data: ${JSON.stringify({ content: chunk })}\n\n`)
-            );
-            index++;
-            setTimeout(sendChunk, 100); // Simulate typing speed
-          } else {
-            controller.enqueue(encoder.encode(`data: [DONE]\n\n`));
-            controller.close();
-          }
-        };
-
-        sendChunk();
-      },
+    // Save user message to database
+    const userMessage = await DatabaseService.createMessage({
+      sessionId: session.id,
+      model,
+      role: "user",
+      content: message,
     });
 
+    // Prepare messages for AI (include conversation history)
+    const conversationHistory = await DatabaseService.getSessionMessages(
+      session.id
+    );
+    const aiMessages: ChatMessage[] = conversationHistory.map((msg: any) => ({
+      role: msg.role as "user" | "assistant",
+      content: msg.content,
+    }));
+
+    // Add system message for context
+    const systemMessage: ChatMessage = {
+      role: "system",
+      content:
+        "You are a helpful AI assistant. Provide clear, accurate, and helpful responses.",
+    };
+
+    const messages = [systemMessage, ...aiMessages];
+
+    // Get streaming response from OpenRouter
+    const stream = await streamChatWithModel(model, messages);
+
+    // Return streaming response
     return new NextResponse(stream, {
       headers: {
         "Content-Type": "text/plain; charset=utf-8",
@@ -62,6 +66,14 @@ Features that would be implemented:
     });
   } catch (error) {
     console.error("Chat API error:", error);
+
+    if (error instanceof Error && error.message.includes("not authenticated")) {
+      return NextResponse.json(
+        { error: "Authentication required" },
+        { status: 401 }
+      );
+    }
+
     return NextResponse.json(
       { error: "Internal server error" },
       { status: 500 }
